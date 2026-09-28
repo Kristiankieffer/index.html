@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#111111" />
+<title>Drone</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: #111111;
+    color: #e8e8e6;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px 22px calc(24px + env(safe-area-inset-bottom));
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .wrap { width: 100%; max-width: 420px; }
+  .readout { text-align: center; margin-bottom: 30px; }
+  .hz { font-size: 64px; font-weight: 300; letter-spacing: -0.02em; line-height: 1; }
+  .hz span { font-size: 24px; color: #8a8a86; margin-left: 6px; }
+  .note { font-size: 13px; color: #8a8a86; margin-top: 12px; min-height: 34px; line-height: 1.5; }
+  .note.warn { color: #d8a35c; }
+  .note.bad { color: #e08a84; }
+  .field { margin-bottom: 24px; }
+  .label {
+    display: flex; justify-content: space-between;
+    font-size: 13px; color: #8a8a86; margin-bottom: 12px;
+    letter-spacing: 0.02em;
+  }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 34px; background: transparent; margin: 0;
+  }
+  input[type=range]::-webkit-slider-runnable-track {
+    height: 3px; background: #333331; border-radius: 2px;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 30px; height: 30px; border-radius: 50%;
+    background: #e8e8e6; margin-top: -13.5px;
+  }
+  input[type=range]::-moz-range-track { height: 3px; background: #333331; border-radius: 2px; }
+  input[type=range]::-moz-range-thumb {
+    width: 30px; height: 30px; border: none; border-radius: 50%; background: #e8e8e6;
+  }
+  .presets { display: flex; gap: 8px; margin-bottom: 28px; }
+  .presets button {
+    flex: 1; padding: 12px 0; font-size: 14px;
+    background: #1c1c1b; color: #c9c9c5;
+    border: 1px solid #2e2e2c; border-radius: 10px;
+    font-family: inherit; cursor: pointer;
+  }
+  .presets button.on { background: #e8e8e6; color: #111111; border-color: #e8e8e6; }
+  #play {
+    width: 100%; padding: 22px 0; font-size: 18px; font-weight: 500;
+    background: #e8e8e6; color: #111111;
+    border: none; border-radius: 14px;
+    font-family: inherit; cursor: pointer;
+  }
+  #play.playing { background: #1c1c1b; color: #e8e8e6; border: 1px solid #333331; }
+  .hint { text-align: center; font-size: 12px; color: #6a6a66; margin-top: 16px; line-height: 1.6; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <div class="readout">
+    <div class="hz" id="hz">60<span>Hz</span></div>
+    <div class="note" id="note">&nbsp;</div>
+  </div>
+
+  <div class="field">
+    <div class="label"><span>frequency</span><span id="fout">60 Hz</span></div>
+    <input type="range" id="freq" min="20" max="400" step="1" value="60" />
+  </div>
+
+  <div class="field">
+    <div class="label"><span>level</span><span id="vout">50%</span></div>
+    <input type="range" id="vol" min="1" max="100" step="1" value="50" />
+  </div>
+
+  <div class="presets" id="presets">
+    <button data-f="40">40</button>
+    <button data-f="60">60</button>
+    <button data-f="80">80</button>
+    <button data-f="110">110</button>
+    <button data-f="146">146</button>
+  </div>
+
+  <button id="play">Play</button>
+
+  <div class="hint" id="hint">Keeps playing with the screen locked.</div>
+
+  <audio id="audio" loop playsinline preload="auto"></audio>
+
+</div>
+
+<script>
+(function () {
+  var RATE = 44100;
+  var LOOP_SECONDS = 2;
+
+  var freq = document.getElementById('freq');
+  var vol = document.getElementById('vol');
+  var hz = document.getElementById('hz');
+  var fout = document.getElementById('fout');
+  var vout = document.getElementById('vout');
+  var note = document.getElementById('note');
+  var play = document.getElementById('play');
+  var audio = document.getElementById('audio');
+  var presets = document.getElementById('presets');
+  var hint = document.getElementById('hint');
+
+  var playing = false;
+  var renderTimer = null;
+  var builtFor = null;
+
+  var mode = 'media';
+  var ctx = null, osc = null, gain = null;
+
+  function say(text, cls) {
+    note.textContent = text || ' ';
+    note.className = 'note' + (cls ? ' ' + cls : '');
+  }
+
+  function amplitude() {
+    return Math.pow(parseInt(vol.value, 10) / 100, 1.4) * 0.9;
+  }
+
+  function toBase64(bytes) {
+    var CHUNK = 0x8000, parts = [];
+    for (var i = 0; i < bytes.length; i += CHUNK) {
+      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK)));
+    }
+    return btoa(parts.join(''));
+  }
+
+  function renderWav(frequency, amp) {
+    var cycles = Math.max(1, Math.round(LOOP_SECONDS * frequency));
+    var frames = Math.round(cycles / frequency * RATE);
+    var nbytes = frames * 2;
+
+    var buffer = new ArrayBuffer(44 + nbytes);
+    var view = new DataView(buffer);
+
+    function str(off, s) {
+      for (var i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i));
+    }
+
+    str(0, 'RIFF');
+    view.setUint32(4, 36 + nbytes, true);
+    str(8, 'WAVE');
+    str(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, RATE, true);
+    view.setUint32(28, RATE * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    str(36, 'data');
+    view.setUint32(40, nbytes, true);
+
+    var step = 2 * Math.PI * frequency / RATE;
+    var peak = amp * 32767;
+    for (var n = 0; n < frames; n++) {
+      view.setInt16(44 + n * 2, Math.round(Math.sin(step * n) * peak), true);
+    }
+
+    return 'data:audio/wav;base64,' + toBase64(new Uint8Array(buffer));
+  }
+
+  function signature() {
+    return freq.value + ':' + vol.value;
+  }
+
+  function buildMedia() {
+    var sig = signature();
+    if (sig === builtFor) return;
+    audio.src = renderWav(parseInt(freq.value, 10), amplitude());
+    audio.load();
+    builtFor = sig;
+    setMeta();
+  }
+
+  function setMeta() {
+    if (!('mediaSession' in navigator)) return;
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: parseInt(freq.value, 10) + ' Hz',
+        artist: 'Drone'
+      });
+    } catch (e) {}
+  }
+
+  function startWebAudio() {
+    ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === 'suspended') ctx.resume();
+    gain = ctx.createGain();
+    gain.gain.value = 0;
+    osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = parseInt(freq.value, 10);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    gain.gain.setTargetAtTime(amplitude(), ctx.currentTime, 0.4);
+  }
+
+  function stopWebAudio() {
+    if (!osc) return;
+    var o = osc, g = gain;
+    g.gain.setTargetAtTime(0, ctx.currentTime, 0.2);
+    setTimeout(function () { try { o.stop(); } catch (e) {} }, 800);
+    osc = null; gain = null;
+  }
+
+  function markPlaying(on) {
+    playing = on;
+    play.textContent = on ? 'Stop' : 'Play';
+    play.classList.toggle('playing', on);
+  }
+
+  function fallbackToWebAudio(reason) {
+    mode = 'webaudio';
+    hint.textContent = 'Running in fallback mode — will stop if you switch apps.';
+    startWebAudio();
+    markPlaying(true);
+    say(reason, 'warn');
+  }
+
+  function speakerNote() {
+    var f = parseInt(freq.value, 10);
+    if (f < 50) return ['Below most speaker and earbud response — use headphones', 'warn'];
+    if (f < 90) return ['Laptop speakers barely reproduce this — use headphones', 'warn'];
+    return ['', ''];
+  }
+
+  function refreshNote() {
+    if (mode === 'webaudio') return;
+    var s = speakerNote();
+    say(s[0], s[1]);
+  }
+
+  function paint() {
+    var f = parseInt(freq.value, 10);
+    hz.innerHTML = f + '<span>Hz</span>';
+    fout.textContent = f + ' Hz';
+    vout.textContent = parseInt(vol.value, 10) + '%';
+    var kids = presets.children;
+    for (var i = 0; i < kids.length; i++) {
+      kids[i].classList.toggle('on', parseInt(kids[i].dataset.f, 10) === f);
+    }
+  }
+
+  function liveUpdate() {
+    if (mode === 'webaudio' && osc) {
+      osc.frequency.setTargetAtTime(parseInt(freq.value, 10), ctx.currentTime, 0.08);
+      gain.gain.setTargetAtTime(amplitude(), ctx.currentTime, 0.08);
+      return;
+    }
+    clearTimeout(renderTimer);
+    renderTimer = setTimeout(function () {
+      var wasPlaying = playing;
+      buildMedia();
+      if (wasPlaying) audio.play().catch(function () {});
+      refreshNote();
+    }, 260);
+  }
+
+  freq.addEventListener('input', function () { paint(); refreshNote(); liveUpdate(); });
+  vol.addEventListener('input', function () { paint(); liveUpdate(); });
+
+  presets.addEventListener('click', function (e) {
+    if (e.target.tagName !== 'BUTTON') return;
+    freq.value = e.target.dataset.f;
+    paint(); refreshNote(); liveUpdate();
+  });
+
+  play.addEventListener('click', function () {
+    if (playing) {
+      if (mode === 'webaudio') stopWebAudio(); else audio.pause();
+      markPlaying(false);
+      refreshNote();
+      return;
+    }
+
+    if (mode === 'webaudio') { startWebAudio(); markPlaying(true); return; }
+
+    buildMedia();
+    var attempt = audio.play();
+    if (!attempt) { markPlaying(true); return; }
+
+    attempt.then(function () {
+      markPlaying(true);
+      refreshNote();
+    }).catch(function (err) {
+      var code = audio.error ? audio.error.code : 0;
+      if (code === 4 || err.name === 'NotSupportedError') {
+        fallbackToWebAudio('Media playback blocked here — using direct audio instead');
+      } else if (err.name === 'NotAllowedError') {
+        say('Browser blocked autoplay — tap Play once more', 'warn');
+      } else {
+        fallbackToWebAudio('Falling back: ' + err.name);
+      }
+    });
+  });
+
+  audio.addEventListener('error', function () {
+    if (mode === 'media' && playing) {
+      fallbackToWebAudio('Audio file failed to load — using direct audio');
+    }
+  });
+
+  audio.addEventListener('pause', function () {
+    if (playing && mode === 'media' && !audio.ended) markPlaying(false);
+  });
+
+  if ('mediaSession' in navigator) {
+    try {
+      navigator.mediaSession.setActionHandler('play', function () {
+        audio.play(); markPlaying(true);
+      });
+      navigator.mediaSession.setActionHandler('pause', function () {
+        audio.pause(); markPlaying(false);
+      });
+    } catch (e) {}
+  }
+
+  if (location.protocol === 'file:') {
+    hint.textContent = 'Opened as a local file — background playback needs a real URL.';
+  }
+
+  paint();
+  refreshNote();
+  buildMedia();
+})();
+</script>
+</body>
+</html>
