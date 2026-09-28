@@ -30,7 +30,6 @@
   .hz span { font-size: 24px; color: #8a8a86; margin-left: 6px; }
   .note { font-size: 13px; color: #8a8a86; margin-top: 12px; min-height: 34px; line-height: 1.5; }
   .note.warn { color: #d8a35c; }
-  .note.bad { color: #e08a84; }
   .field { margin-bottom: 24px; }
   .label {
     display: flex; justify-content: space-between;
@@ -100,17 +99,14 @@
 
   <button id="play">Play</button>
 
-  <div class="hint" id="hint">Keeps playing with the screen locked.</div>
+  <div class="hint" id="hint">Continuous tone. Keeps playing with the screen locked.</div>
 
-  <audio id="audio" loop playsinline preload="auto"></audio>
+  <audio id="keeper" loop playsinline preload="auto"></audio>
 
 </div>
 
 <script>
 (function () {
-  var RATE = 44100;
-  var LOOP_SECONDS = 2;
-
   var freq = document.getElementById('freq');
   var vol = document.getElementById('vol');
   var hz = document.getElementById('hz');
@@ -118,39 +114,30 @@
   var vout = document.getElementById('vout');
   var note = document.getElementById('note');
   var play = document.getElementById('play');
-  var audio = document.getElementById('audio');
   var presets = document.getElementById('presets');
   var hint = document.getElementById('hint');
+  var keeper = document.getElementById('keeper');
 
-  var playing = false;
-  var renderTimer = null;
-  var builtFor = null;
-
-  var mode = 'media';
   var ctx = null, osc = null, gain = null;
+  var playing = false;
 
   function say(text, cls) {
     note.textContent = text || ' ';
     note.className = 'note' + (cls ? ' ' + cls : '');
   }
 
-  function amplitude() {
+  function level() {
     return Math.pow(parseInt(vol.value, 10) / 100, 1.4) * 0.9;
   }
 
-  function toBase64(bytes) {
-    var CHUNK = 0x8000, parts = [];
-    for (var i = 0; i < bytes.length; i += CHUNK) {
-      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK)));
-    }
-    return btoa(parts.join(''));
+  function hzValue() {
+    return parseInt(freq.value, 10);
   }
 
-  function renderWav(frequency, amp) {
-    var cycles = Math.max(1, Math.round(LOOP_SECONDS * frequency));
-    var frames = Math.round(cycles / frequency * RATE);
+  function silentLoop() {
+    var RATE = 8000, SECONDS = 2, FREQ = 50;
+    var frames = RATE * SECONDS;
     var nbytes = frames * 2;
-
     var buffer = new ArrayBuffer(44 + nbytes);
     var view = new DataView(buffer);
 
@@ -172,89 +159,80 @@
     str(36, 'data');
     view.setUint32(40, nbytes, true);
 
-    var step = 2 * Math.PI * frequency / RATE;
-    var peak = amp * 32767;
+    var step = 2 * Math.PI * FREQ / RATE;
     for (var n = 0; n < frames; n++) {
-      view.setInt16(44 + n * 2, Math.round(Math.sin(step * n) * peak), true);
+      view.setInt16(44 + n * 2, Math.round(Math.sin(step * n) * 2), true);
     }
 
-    return 'data:audio/wav;base64,' + toBase64(new Uint8Array(buffer));
-  }
-
-  function signature() {
-    return freq.value + ':' + vol.value;
-  }
-
-  function buildMedia() {
-    var sig = signature();
-    if (sig === builtFor) return;
-    audio.src = renderWav(parseInt(freq.value, 10), amplitude());
-    audio.load();
-    builtFor = sig;
-    setMeta();
+    var bytes = new Uint8Array(buffer), CHUNK = 0x8000, parts = [];
+    for (var i = 0; i < bytes.length; i += CHUNK) {
+      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK)));
+    }
+    return 'data:audio/wav;base64,' + btoa(parts.join(''));
   }
 
   function setMeta() {
     if (!('mediaSession' in navigator)) return;
     try {
       navigator.mediaSession.metadata = new MediaMetadata({
-        title: parseInt(freq.value, 10) + ' Hz',
+        title: hzValue() + ' Hz',
         artist: 'Drone'
       });
+      navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
     } catch (e) {}
   }
 
-  function startWebAudio() {
+  function start() {
     ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
     if (ctx.state === 'suspended') ctx.resume();
+
+    keeper.play().catch(function () {});
+
     gain = ctx.createGain();
     gain.gain.value = 0;
     osc = ctx.createOscillator();
     osc.type = 'sine';
-    osc.frequency.value = parseInt(freq.value, 10);
+    osc.frequency.value = hzValue();
     osc.connect(gain);
     gain.connect(ctx.destination);
     osc.start();
-    gain.gain.setTargetAtTime(amplitude(), ctx.currentTime, 0.4);
+    gain.gain.setTargetAtTime(level(), ctx.currentTime, 0.35);
+
+    playing = true;
+    play.textContent = 'Stop';
+    play.classList.add('playing');
+    setMeta();
   }
 
-  function stopWebAudio() {
+  function stop() {
+    if (osc) {
+      var o = osc;
+      gain.gain.setTargetAtTime(0, ctx.currentTime, 0.18);
+      setTimeout(function () { try { o.stop(); o.disconnect(); } catch (e) {} }, 900);
+      osc = null; gain = null;
+    }
+    keeper.pause();
+    playing = false;
+    play.textContent = 'Play';
+    play.classList.remove('playing');
+    setMeta();
+  }
+
+  function apply() {
     if (!osc) return;
-    var o = osc, g = gain;
-    g.gain.setTargetAtTime(0, ctx.currentTime, 0.2);
-    setTimeout(function () { try { o.stop(); } catch (e) {} }, 800);
-    osc = null; gain = null;
-  }
-
-  function markPlaying(on) {
-    playing = on;
-    play.textContent = on ? 'Stop' : 'Play';
-    play.classList.toggle('playing', on);
-  }
-
-  function fallbackToWebAudio(reason) {
-    mode = 'webaudio';
-    hint.textContent = 'Running in fallback mode — will stop if you switch apps.';
-    startWebAudio();
-    markPlaying(true);
-    say(reason, 'warn');
+    osc.frequency.setTargetAtTime(hzValue(), ctx.currentTime, 0.06);
+    gain.gain.setTargetAtTime(level(), ctx.currentTime, 0.06);
   }
 
   function speakerNote() {
-    var f = parseInt(freq.value, 10);
+    var f = hzValue();
     if (f < 50) return ['Below most speaker and earbud response — use headphones', 'warn'];
     if (f < 90) return ['Laptop speakers barely reproduce this — use headphones', 'warn'];
     return ['', ''];
   }
 
-  function refreshNote() {
-    if (mode === 'webaudio') return;
-    var s = speakerNote();
-    say(s[0], s[1]);
-  }
-
   function paint() {
-    var f = parseInt(freq.value, 10);
+    var f = hzValue();
     hz.innerHTML = f + '<span>Hz</span>';
     fout.textContent = f + ' Hz';
     vout.textContent = parseInt(vol.value, 10) + '%';
@@ -262,89 +240,45 @@
     for (var i = 0; i < kids.length; i++) {
       kids[i].classList.toggle('on', parseInt(kids[i].dataset.f, 10) === f);
     }
+    var s = speakerNote();
+    say(s[0], s[1]);
   }
 
-  function liveUpdate() {
-    if (mode === 'webaudio' && osc) {
-      osc.frequency.setTargetAtTime(parseInt(freq.value, 10), ctx.currentTime, 0.08);
-      gain.gain.setTargetAtTime(amplitude(), ctx.currentTime, 0.08);
-      return;
-    }
-    clearTimeout(renderTimer);
-    renderTimer = setTimeout(function () {
-      var wasPlaying = playing;
-      buildMedia();
-      if (wasPlaying) audio.play().catch(function () {});
-      refreshNote();
-    }, 260);
-  }
-
-  freq.addEventListener('input', function () { paint(); refreshNote(); liveUpdate(); });
-  vol.addEventListener('input', function () { paint(); liveUpdate(); });
+  freq.addEventListener('input', function () { paint(); apply(); setMeta(); });
+  vol.addEventListener('input', function () { paint(); apply(); });
 
   presets.addEventListener('click', function (e) {
     if (e.target.tagName !== 'BUTTON') return;
     freq.value = e.target.dataset.f;
-    paint(); refreshNote(); liveUpdate();
+    paint(); apply(); setMeta();
   });
 
   play.addEventListener('click', function () {
-    if (playing) {
-      if (mode === 'webaudio') stopWebAudio(); else audio.pause();
-      markPlaying(false);
-      refreshNote();
-      return;
-    }
-
-    if (mode === 'webaudio') { startWebAudio(); markPlaying(true); return; }
-
-    buildMedia();
-    var attempt = audio.play();
-    if (!attempt) { markPlaying(true); return; }
-
-    attempt.then(function () {
-      markPlaying(true);
-      refreshNote();
-    }).catch(function (err) {
-      var code = audio.error ? audio.error.code : 0;
-      if (code === 4 || err.name === 'NotSupportedError') {
-        fallbackToWebAudio('Media playback blocked here — using direct audio instead');
-      } else if (err.name === 'NotAllowedError') {
-        say('Browser blocked autoplay — tap Play once more', 'warn');
-      } else {
-        fallbackToWebAudio('Falling back: ' + err.name);
-      }
-    });
+    if (playing) stop(); else start();
   });
 
-  audio.addEventListener('error', function () {
-    if (mode === 'media' && playing) {
-      fallbackToWebAudio('Audio file failed to load — using direct audio');
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && playing && ctx && ctx.state === 'suspended') {
+      ctx.resume();
+      keeper.play().catch(function () {});
     }
-  });
-
-  audio.addEventListener('pause', function () {
-    if (playing && mode === 'media' && !audio.ended) markPlaying(false);
   });
 
   if ('mediaSession' in navigator) {
     try {
-      navigator.mediaSession.setActionHandler('play', function () {
-        audio.play(); markPlaying(true);
-      });
-      navigator.mediaSession.setActionHandler('pause', function () {
-        audio.pause(); markPlaying(false);
-      });
+      navigator.mediaSession.setActionHandler('play', function () { if (!playing) start(); });
+      navigator.mediaSession.setActionHandler('pause', function () { if (playing) stop(); });
     } catch (e) {}
   }
+
+  keeper.volume = 1;
+  keeper.src = silentLoop();
 
   if (location.protocol === 'file:') {
     hint.textContent = 'Opened as a local file — background playback needs a real URL.';
   }
 
   paint();
-  refreshNote();
-  buildMedia();
 })();
 </script>
 </body>
