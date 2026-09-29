@@ -67,6 +67,7 @@
     font-family: inherit; cursor: pointer;
   }
   #play.playing { background: #1c1c1b; color: #e8e8e6; border: 1px solid #333331; }
+  #play.busy { background: #2a2a28; color: #8a8a86; }
   .hint { text-align: center; font-size: 12px; color: #6a6a66; margin-top: 16px; line-height: 1.6; }
 </style>
 </head>
@@ -99,14 +100,18 @@
 
   <button id="play">Play</button>
 
-  <div class="hint" id="hint">Continuous tone. Keeps playing with the screen locked.</div>
+  <div class="hint" id="hint">Plays with the screen locked. Use your phone's volume buttons too.</div>
 
-  <audio id="keeper" loop playsinline preload="auto"></audio>
+  <audio id="audio" loop playsinline preload="auto"></audio>
 
 </div>
 
 <script>
 (function () {
+  var RATE = 11025;
+  var MINUTES = 10;
+  var FADE = 0.3;
+
   var freq = document.getElementById('freq');
   var vol = document.getElementById('vol');
   var hz = document.getElementById('hz');
@@ -116,28 +121,28 @@
   var play = document.getElementById('play');
   var presets = document.getElementById('presets');
   var hint = document.getElementById('hint');
-  var keeper = document.getElementById('keeper');
+  var audio = document.getElementById('audio');
 
-  var ctx = null, osc = null, gain = null;
   var playing = false;
+  var building = false;
+  var builtFor = null;
+  var currentUrl = null;
+  var pending = null;
 
   function say(text, cls) {
     note.textContent = text || ' ';
     note.className = 'note' + (cls ? ' ' + cls : '');
   }
 
-  function level() {
-    return Math.pow(parseInt(vol.value, 10) / 100, 1.4) * 0.9;
-  }
+  function hzValue() { return parseInt(freq.value, 10); }
+  function level() { return Math.pow(parseInt(vol.value, 10) / 100, 1.4) * 0.9; }
+  function signature() { return freq.value + ':' + vol.value; }
 
-  function hzValue() {
-    return parseInt(freq.value, 10);
-  }
-
-  function silentLoop() {
-    var RATE = 8000, SECONDS = 2, FREQ = 50;
-    var frames = RATE * SECONDS;
+  function buildBuffer(frequency, amp) {
+    var cycles = Math.max(1, Math.round(MINUTES * 60 * frequency));
+    var frames = Math.round(cycles / frequency * RATE);
     var nbytes = frames * 2;
+
     var buffer = new ArrayBuffer(44 + nbytes);
     var view = new DataView(buffer);
 
@@ -159,16 +164,21 @@
     str(36, 'data');
     view.setUint32(40, nbytes, true);
 
-    var step = 2 * Math.PI * FREQ / RATE;
+    var step = 2 * Math.PI * frequency / RATE;
+    var peak = amp * 32767;
+    var fadeFrames = Math.round(FADE * RATE);
+
     for (var n = 0; n < frames; n++) {
-      view.setInt16(44 + n * 2, Math.round(Math.sin(step * n) * 2), true);
+      var env = 1;
+      if (n < fadeFrames) {
+        env = 0.5 - 0.5 * Math.cos(Math.PI * n / fadeFrames);
+      } else if (n >= frames - fadeFrames) {
+        env = 0.5 - 0.5 * Math.cos(Math.PI * (frames - 1 - n) / fadeFrames);
+      }
+      view.setInt16(44 + n * 2, Math.round(Math.sin(step * n) * peak * env), true);
     }
 
-    var bytes = new Uint8Array(buffer), CHUNK = 0x8000, parts = [];
-    for (var i = 0; i < bytes.length; i += CHUNK) {
-      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK)));
-    }
-    return 'data:audio/wav;base64,' + btoa(parts.join(''));
+    return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
   }
 
   function setMeta() {
@@ -182,46 +192,66 @@
     } catch (e) {}
   }
 
+  function setButton() {
+    if (building) {
+      play.textContent = 'Building…';
+      play.className = 'busy';
+    } else if (playing) {
+      play.textContent = 'Stop';
+      play.className = 'playing';
+    } else {
+      play.textContent = 'Play';
+      play.className = '';
+    }
+  }
+
+  function ensureBuffer(done) {
+    var sig = signature();
+    if (sig === builtFor && currentUrl) { done(); return; }
+    if (building) { pending = done; return; }
+
+    building = true;
+    setButton();
+
+    requestAnimationFrame(function () {
+      setTimeout(function () {
+        var url = buildBuffer(hzValue(), level());
+        var old = currentUrl;
+        currentUrl = url;
+        builtFor = sig;
+        audio.src = url;
+        audio.load();
+        if (old) setTimeout(function () { URL.revokeObjectURL(old); }, 2000);
+
+        building = false;
+        setMeta();
+        setButton();
+
+        var next = pending; pending = null;
+        done();
+        if (next) next();
+      }, 0);
+    });
+  }
+
   function start() {
-    ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
-    if (ctx.state === 'suspended') ctx.resume();
-
-    keeper.play().catch(function () {});
-
-    gain = ctx.createGain();
-    gain.gain.value = 0;
-    osc = ctx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.value = hzValue();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start();
-    gain.gain.setTargetAtTime(level(), ctx.currentTime, 0.35);
-
-    playing = true;
-    play.textContent = 'Stop';
-    play.classList.add('playing');
-    setMeta();
+    ensureBuffer(function () {
+      audio.play().then(function () {
+        playing = true;
+        setButton();
+        setMeta();
+        refreshNote();
+      }).catch(function (err) {
+        say('Could not start: ' + err.name + ' — tap Play again', 'warn');
+      });
+    });
   }
 
   function stop() {
-    if (osc) {
-      var o = osc;
-      gain.gain.setTargetAtTime(0, ctx.currentTime, 0.18);
-      setTimeout(function () { try { o.stop(); o.disconnect(); } catch (e) {} }, 900);
-      osc = null; gain = null;
-    }
-    keeper.pause();
+    audio.pause();
     playing = false;
-    play.textContent = 'Play';
-    play.classList.remove('playing');
+    setButton();
     setMeta();
-  }
-
-  function apply() {
-    if (!osc) return;
-    osc.frequency.setTargetAtTime(hzValue(), ctx.currentTime, 0.06);
-    gain.gain.setTargetAtTime(level(), ctx.currentTime, 0.06);
   }
 
   function speakerNote() {
@@ -229,6 +259,11 @@
     if (f < 50) return ['Below most speaker and earbud response — use headphones', 'warn'];
     if (f < 90) return ['Laptop speakers barely reproduce this — use headphones', 'warn'];
     return ['', ''];
+  }
+
+  function refreshNote() {
+    var s = speakerNote();
+    say(s[0], s[1]);
   }
 
   function paint() {
@@ -240,28 +275,41 @@
     for (var i = 0; i < kids.length; i++) {
       kids[i].classList.toggle('on', parseInt(kids[i].dataset.f, 10) === f);
     }
-    var s = speakerNote();
-    say(s[0], s[1]);
+    refreshNote();
   }
 
-  freq.addEventListener('input', function () { paint(); apply(); setMeta(); });
-  vol.addEventListener('input', function () { paint(); apply(); });
+  function settled() {
+    if (signature() === builtFor) return;
+    if (playing) {
+      ensureBuffer(function () { audio.play().catch(function () {}); });
+    } else {
+      builtFor = null;
+    }
+  }
+
+  freq.addEventListener('input', paint);
+  vol.addEventListener('input', paint);
+  freq.addEventListener('change', settled);
+  vol.addEventListener('change', settled);
 
   presets.addEventListener('click', function (e) {
     if (e.target.tagName !== 'BUTTON') return;
     freq.value = e.target.dataset.f;
-    paint(); apply(); setMeta();
+    paint();
+    settled();
   });
 
   play.addEventListener('click', function () {
+    if (building) return;
     if (playing) stop(); else start();
   });
 
-  document.addEventListener('visibilitychange', function () {
-    if (!document.hidden && playing && ctx && ctx.state === 'suspended') {
-      ctx.resume();
-      keeper.play().catch(function () {});
-    }
+  audio.addEventListener('ended', function () {
+    if (playing) { audio.currentTime = 0; audio.play().catch(function () {}); }
+  });
+
+  audio.addEventListener('pause', function () {
+    if (playing && !audio.ended) { playing = false; setButton(); setMeta(); }
   });
 
   if ('mediaSession' in navigator) {
@@ -271,14 +319,12 @@
     } catch (e) {}
   }
 
-  keeper.volume = 1;
-  keeper.src = silentLoop();
-
   if (location.protocol === 'file:') {
     hint.textContent = 'Opened as a local file — background playback needs a real URL.';
   }
 
   paint();
+  setButton();
 })();
 </script>
 </body>
